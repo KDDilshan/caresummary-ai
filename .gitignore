@@ -1,0 +1,16 @@
+# Big downloaded/generated files - never push these to GitHub
+tools/
+fhir-data/
+notes/
+
+# Java build output
+target/
+*.class
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Secrets (AI API keys go here later)
+.env

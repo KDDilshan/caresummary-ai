@@ -1,0 +1,14 @@
+# Starts the FHIR server (a ready-made health-data database with a REST API).
+# Run:  docker compose up -d      Stop:  docker compose stop
+# Open: http://localhost:8090/fhir/Patient
+
+services:
+  fhir:
+    image: hapiproject/hapi:latest
+    container_name: caresummary-fhir
+    ports:
+      - "8090:8080"            # FHIR on 8090, so 8080 stays free for our Spring Boot app
+    environment:
+      JAVA_TOOL_OPTIONS: "-Xmx768m"   # keep memory low (this PC has ~7 GB RAM)
+      hapi.fhir.fhir_version: R4
+    restart: unless-stopped
