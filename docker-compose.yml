@@ -1,14 +1,37 @@
-# Starts the FHIR server (a ready-made health-data database with a REST API).
+# Starts the two servers the API needs.
 # Run:  docker compose up -d      Stop:  docker compose stop
-# Open: http://localhost:8090/fhir/Patient
+#   FHIR server  -> http://localhost:8090/fhir/Patient   (health data, a database with a REST API)
+#   PostgreSQL   -> localhost:5432                       (audit log)
 
 services:
   fhir:
     image: hapiproject/hapi:latest
     container_name: caresummary-fhir
+    user: "0:0"                # root, so it can write its database file to the /data volume (local demo only)
     ports:
       - "8090:8080"            # FHIR on 8090, so 8080 stays free for our Spring Boot app
     environment:
       JAVA_TOOL_OPTIONS: "-Xmx768m"   # keep memory low (this PC has ~7 GB RAM)
       hapi.fhir.fhir_version: R4
+      # Default HAPI storage is in memory (lost on restart). Save it to a file in a volume instead.
+      spring.datasource.url: "jdbc:h2:file:/data/hapi;DB_CLOSE_ON_EXIT=FALSE"
+    volumes:
+      - fhirdata:/data
     restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    container_name: caresummary-db
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: caresummary
+      POSTGRES_USER: ${DB_USER:-caresummary}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-caresummary}   # local demo only
+    volumes:
+      - dbdata:/var/lib/postgresql/data              # keeps the audit log when the container restarts
+    restart: unless-stopped
+
+volumes:
+  dbdata:
+  fhirdata:

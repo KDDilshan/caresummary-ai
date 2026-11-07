@@ -1,52 +1,64 @@
 # CareSummary AI
 
-A Spring Boot app that gives clinicians a short, **source-linked** summary of a patient's health record.
-It reads standard **FHIR R4** health data, and every line of the AI summary points back to the record it came from, so a doctor can check it.
+A full-stack app that gives clinicians a short, **source-linked** AI summary of a patient's health record.
+It reads standard **FHIR R4** health data. Every line the AI writes must cite the record it came from,
+and the API **checks those citations against the real records** before showing them — so a doctor can trust, or quickly check, each line.
 
-> ⚠️ Uses **synthetic (fake) patients only**, generated with [Synthea](https://github.com/synthetichealth/synthea). Not a medical device and not medical advice.
+> ⚠️ **Synthetic (fake) patients only**, generated with [Synthea](https://github.com/synthetichealth/synthea). Not a medical device and not medical advice.
 
-## Status
+## Features
 
-| Part | State |
-|------|-------|
-| FHIR server + 34 synthetic patients | ✅ Done |
-| Patient REST API (list, search, detail) | ✅ Done |
-| AI summary with source links (Spring AI) | 🔜 Next |
-| Ask questions about one patient | 🔜 Next |
-| React UI | 🔜 Next |
-| Login + roles, audit log, data masking | 🔜 Planned |
-| CI with GitHub Actions | 🔜 Planned |
+- **Patient list and search** from a FHIR server (34 synthetic patients)
+- **Patient record view**: conditions, medicines, latest vital signs and lab results, with an "active only" filter
+- **AI summary** (Gemini via Spring AI) where every line links to its source record. Click a source to jump to that row.
+- **Ask a question** about one patient. The answer uses only that patient's records.
+- **Hallucination check**: sources the AI invents are removed, and lines without a real source are flagged ⚠
+- **Privacy**: the AI never receives the patient's name, ID or birth date, only age, gender and clinical facts
+- **Login with JWT** and two roles: `DOCTOR` (patients + AI) and `ADMIN` (audit log only, no patient data)
+- **Audit log** in PostgreSQL: every login, patient view and AI request (who, what, when)
+- **CI** with GitHub Actions: API tests and UI type-check/build on every push
 
-## How it works
+## Architecture
 
 ```
-React UI  ──►  Spring Boot API (port 8080)  ──►  HAPI FHIR server (port 8090, Docker)
-                     │                                  ▲
-                     └──►  LLM (summary, Q&A)           └── Synthea fake patients
+React UI (Vite, :5173)
+      │  JWT in "Authorization: Bearer ..."
+      ▼
+Spring Boot API (:8080) ──── Spring Security (JWT, roles)
+      │        │        └── Audit log ──► PostgreSQL (:5432)
+      │        └── Spring AI ──► Google Gemini   (facts only, no name/ID)
+      ▼
+HAPI FHIR server (:8090, Docker) ◄── Synthea fake patients
 ```
 
-- **FHIR** is the global standard for health data. Each record (Patient, Condition, MedicationRequest, Observation) is a JSON "resource".
-- The API uses the **HAPI FHIR client** to read records and turns them into small DTOs.
-- Each item keeps its FHIR reference (e.g. `Condition/2266`). The AI summary will cite these.
+**AI flow:** load patient records from FHIR → build a fact list where each fact starts with its source (`[Condition/2040] Essential hypertension | active | 2024-07-04`) → send facts + strict rules to Gemini → get structured JSON (`lines[].text`, `lines[].sources`) → keep only sources that exist → mark lines with no real source as unverified → save an audit event → return.
 
 ## API
 
-| Method | Path | What it returns |
-|--------|------|-----------------|
-| GET | `/api/patients?name=agn` | Patient list (optional name search) |
-| GET | `/api/patients/{id}` | Patient + conditions + medications + latest vitals/labs |
+| Method | Path | Role | Returns |
+|--------|------|------|---------|
+| POST | `/api/auth/login` | anyone | JWT token + roles |
+| GET | `/api/auth/me` | any logged-in user | username + roles |
+| GET | `/api/patients?name=` | DOCTOR | patient list (optional name search) |
+| GET | `/api/patients/{id}` | DOCTOR | patient + conditions + medicines + latest vitals/labs |
+| POST | `/api/patients/{id}/summary?refresh=false` | DOCTOR | AI summary with checked sources |
+| POST | `/api/patients/{id}/ask` `{"question": "..."}` | DOCTOR | AI answer with checked sources |
+| GET | `/api/ai/status` | DOCTOR | is the AI configured? |
+| GET | `/api/audit?patientId=` | ADMIN | latest 200 audit events |
 
-Errors use standard JSON problem details: `404` (unknown patient), `400` (bad id), `503` (FHIR server down).
+Errors are JSON "problem details": `400` bad input, `401` not logged in, `403` wrong role, `404` unknown patient, `503` FHIR server or AI unavailable.
 
 ## Run it locally
 
-Needs: Java 17+, Docker Desktop.
+Needs: Java 17+, Node 20+, Docker Desktop.
+
+**1. Start the FHIR server and PostgreSQL**
 
 ```bash
-docker compose up -d                 # start the FHIR server (first start ~1-2 min)
+docker compose up -d
 ```
 
-Make fake patients and load them (first time only):
+**2. Load fake patients (first time only).** Download `synthea-with-dependencies.jar` from the [Synthea releases](https://github.com/synthetichealth/synthea/releases) into `tools/`, then:
 
 ```bash
 java -jar tools/synthea-with-dependencies.jar -p 30 -s 42 --exporter.baseDirectory ./fhir-data Massachusetts
@@ -56,20 +68,43 @@ java -jar tools/synthea-with-dependencies.jar -p 30 -s 42 --exporter.baseDirecto
 .\load-patients.ps1
 ```
 
-Start the API:
+**3. Add your AI key.** Copy `.env.example` to `.env` and set `GEMINI_API_KEY` (free key from [Google AI Studio](https://aistudio.google.com/apikey)). Without a key, everything works except the AI buttons.
+
+**4. Start the API**
 
 ```bash
 cd caresummary-api
 ./mvnw spring-boot:run
 ```
 
-Open http://localhost:8080/api/patients
+**5. Start the UI**
+
+```bash
+cd caresummary-ui
+npm install
+npm run dev
+```
+
+Open http://localhost:5173 and log in as `doctor` / `doctor123` or `admin` / `admin123`. These are local demo passwords; change them in `.env`.
+
+## Tests
+
+```bash
+cd caresummary-api
+./mvnw test
+```
+
+23 tests: FHIR mapping, the source checker (hallucination guard), privacy of the AI input, and API security (login, roles, 401/403, validation, audit log). Tests use an in-memory H2 database and mocks, so no Docker or AI key is needed.
 
 ## Tech
 
-Java 17 · Spring Boot 4 · HAPI FHIR 8 · Docker · JUnit 5 · AssertJ
+Java 17 · Spring Boot 4 · Spring Security (JWT) · Spring AI 2 · Google Gemini · HAPI FHIR 8 · Spring Data JPA · PostgreSQL · React 19 · TypeScript · Vite · Docker Compose · JUnit 5 · Mockito · GitHub Actions
 
-## Data rules
+## Limits (honest list)
 
-- Synthetic data only. No real patient data, ever.
-- `tools/` and `fhir-data/` are not committed (large downloaded/generated files).
+- Demo users live in memory; a real system would use a user database or hospital single sign-on.
+- The summary cache is in memory and resets on restart.
+- No rate limiting on login yet.
+- Only a sample of each record is sent to the AI (up to 60 conditions, 60 medicines, 40 latest results).
+
+See [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md) for a plain-English walkthrough and interview questions.

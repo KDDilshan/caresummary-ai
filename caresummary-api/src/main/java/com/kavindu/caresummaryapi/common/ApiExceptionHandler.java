@@ -1,11 +1,13 @@
 package com.kavindu.caresummaryapi.common;
 
 import ca.uhn.fhir.rest.client.exceptions.FhirClientConnectionException;
+import com.kavindu.caresummaryapi.ai.AiUnavailableException;
 import com.kavindu.caresummaryapi.patient.PatientNotFoundException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
+import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
@@ -26,6 +28,20 @@ public class ApiExceptionHandler {
     @ExceptionHandler(BadRequestException.class)
     public ProblemDetail badRequest(BadRequestException e) {
         return ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, e.getMessage());
+    }
+
+    /** @Valid failed on a request body, e.g. empty question */
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ProblemDetail invalidBody(MethodArgumentNotValidException e) {
+        String msg = e.getBindingResult().getFieldErrors().stream()
+                .map(f -> f.getDefaultMessage())
+                .findFirst().orElse("Invalid request");
+        return ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, msg);
+    }
+
+    @ExceptionHandler(AiUnavailableException.class)
+    public ProblemDetail aiDown(AiUnavailableException e) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.SERVICE_UNAVAILABLE, e.getMessage());
     }
 
     @ExceptionHandler(FhirClientConnectionException.class)

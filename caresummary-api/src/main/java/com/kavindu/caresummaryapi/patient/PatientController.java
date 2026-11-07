@@ -1,8 +1,11 @@
 package com.kavindu.caresummaryapi.patient;
 
+import com.kavindu.caresummaryapi.audit.AuditEvent.Action;
+import com.kavindu.caresummaryapi.audit.AuditService;
 import com.kavindu.caresummaryapi.common.BadRequestException;
 import com.kavindu.caresummaryapi.patient.dto.PatientDetail;
 import com.kavindu.caresummaryapi.patient.dto.PatientSummary;
+import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -10,39 +13,40 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
-import java.util.regex.Pattern;
 
 /**
- * REST endpoints for patients.
+ * REST endpoints for patients (DOCTOR role only, see SecurityConfig).
  *   GET /api/patients            -> list (optional ?name=)
  *   GET /api/patients/{id}       -> one patient with their records
+ * Every call is written to the audit log.
  */
 @RestController
 @RequestMapping("/api/patients")
 public class PatientController {
 
-    /** FHIR ids are letters, numbers, '-' and '.', max 64 chars. Anything else is rejected. */
-    private static final Pattern FHIR_ID = Pattern.compile("[A-Za-z0-9\\-.]{1,64}");
-
     private final PatientService patients;
+    private final AuditService audit;
 
-    public PatientController(PatientService patients) {
+    public PatientController(PatientService patients, AuditService audit) {
         this.patients = patients;
+        this.audit = audit;
     }
 
     @GetMapping
-    public List<PatientSummary> list(@RequestParam(required = false) String name) {
+    public List<PatientSummary> list(@RequestParam(required = false) String name, Authentication user) {
         if (name != null && name.length() > 50) {
             throw new BadRequestException("Search text is too long (max 50 characters)");
         }
-        return patients.listPatients(name);
+        List<PatientSummary> result = patients.listPatients(name);
+        audit.record(user.getName(), Action.LIST_PATIENTS, null,
+                (name == null || name.isBlank() ? "all" : "search: " + name) + ", " + result.size() + " results");
+        return result;
     }
 
     @GetMapping("/{id}")
-    public PatientDetail get(@PathVariable String id) {
-        if (!FHIR_ID.matcher(id).matches()) {
-            throw new BadRequestException("Invalid patient id");
-        }
-        return patients.getPatient(id);
+    public PatientDetail get(@PathVariable String id, Authentication user) {
+        PatientDetail detail = patients.getPatient(PatientIds.requireValid(id));
+        audit.record(user.getName(), Action.VIEW_PATIENT, id, null);
+        return detail;
     }
 }
