@@ -10,7 +10,7 @@ and the API **checks those citations against the real records** before showing t
 
 - **Patient list and search** from a FHIR server (34 synthetic patients)
 - **Patient record view**: conditions, medicines, latest vital signs and lab results, with an "active only" filter
-- **AI summary** (Gemini via Spring AI) where every line links to its source record. Click a source to jump to that row.
+- **AI summary** (Gemini Flash Lite via Spring AI, 60 s timeout, about 4–10 s per summary) where every line links to its source record. Click a source to jump to that row.
 - **Ask a question** about one patient. The answer uses only that patient's records.
 - **Hallucination check**: sources the AI invents are removed, and lines without a real source are flagged ⚠
 - **Privacy**: the AI never receives the patient's name, ID or birth date, only age, gender and clinical facts

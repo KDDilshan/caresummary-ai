@@ -118,6 +118,11 @@ including GitHub Actions, without Docker or an API key.
   so the rest of the app still works and the UI says "AI is not set up".
 - **The token contained a strange role, `FACTOR_PASSWORD`.** Spring Security 7 adds a marker for
   "logged in with a password". I now keep only real `ROLE_` authorities, and added a test for it.
+- **The AI request spun forever.** A thread dump (`jstack`) showed the Google client waiting for
+  response headers with no timeout. I gave Spring AI my own Gemini `Client` bean with a 60-second timeout
+  (`GeminiClientConfig`), so a stuck call now returns a clear 503 "try again". Testing Gemini directly
+  showed the main Flash models were hanging even for "Say OK", while Flash Lite answered in 2 seconds,
+  so the app now uses Flash Lite (configurable with `GEMINI_MODEL`).
 - **Lab results were full of long questionnaires.** I filtered observations to the `vital-signs` and
   `laboratory` categories in the FHIR query.
 
@@ -162,6 +167,10 @@ H2 in-memory database for JPA, and `@MockitoBean` replaces the FHIR and AI servi
 **What does CI do?**
 On every push, GitHub Actions builds the API and runs all tests, then type-checks and builds the React app.
 A failing test blocks a green build.
+
+**What happens if the AI service is slow or down?**
+Every Gemini call has a 60-second timeout. On failure the API returns `503` with a clear message,
+the UI shows "try again", and the patient records still work because they don't depend on the AI.
 
 **What would you add next?**
 A real user database or hospital SSO, login rate limiting, Flyway database migrations instead of
