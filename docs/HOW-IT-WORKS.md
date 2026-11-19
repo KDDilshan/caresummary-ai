@@ -72,7 +72,9 @@ caresummary-api/src/main/java/com/kavindu/caresummaryapi/
 │   └── AiToggle.java          turns Spring AI off when there is no API key
 ├── patient/
 │   ├── PatientController.java GET /api/patients, /api/patients/{id}  (+ audit)
-│   ├── PatientService.java    talks to FHIR, paging, limits
+│   ├── PatientService.java    talks to FHIR, paging, limits, runs 3 searches in parallel, load-time metric
+│   ├── FhirWorkers.java       fixed thread pool: run tasks at the same time, wait, timeout, metrics
+│   ├── FhirTimeoutException   FHIR too slow -> 504
 │   ├── FhirMapper.java        FHIR objects -> our small DTOs
 │   ├── PatientIds.java        id validation
 │   └── dto/                   PatientSummary, PatientDetail, ClinicalItem
@@ -87,18 +89,24 @@ caresummary-api/src/main/java/com/kavindu/caresummaryapi/
 │   ├── TokenService.java      makes JWTs
 │   └── AuthController.java    login, /me
 ├── audit/                     AuditEvent (JPA entity), repository, service, controller
+├── monitoring/
+│   ├── FhirHealthIndicator.java      adds "fhir" UP/DOWN to /actuator/health
+│   └── CloudWatchMetricsConfig.java  sends caresummary.* metrics to AWS CloudWatch (when enabled)
 └── common/                    error handling -> JSON problem details
 ```
 
 ---
 
-## 6. Tests (23)
+## 6. Tests (34)
 
 | Test | What it proves |
 |------|----------------|
 | `FhirMapperTest` | FHIR → DTO conversion: names, ages, dates, blood pressure values |
 | `SourceCheckerTest` | made-up sources are removed; lines without real sources are unverified |
 | `PatientFactsTest` | the AI never gets the name, id or birth date |
+| `FhirWorkersTest` | tasks really run at the same time (3 × 400 ms finish in under 1 s), on different threads; results keep their order; a task's error is passed on; a stuck task times out; the pool is measured |
+| `CloudWatchFilterTest` | only `caresummary.*` metrics would be sent to CloudWatch |
+| `ActuatorTest` | health is open but shows only UP/DOWN; admin sees which part is down; metrics need ADMIN; the thread pool shows up in metrics |
 | `ApiSecurityTest` | no token → 401; fake token → 401; doctor can't see audit; admin can't see patients; bad id → 400; unknown → 404; logins and views are audited |
 
 Tests use **H2** (an in-memory database) and **Mockito mocks** for FHIR and the AI, so they run anywhere,
@@ -175,3 +183,120 @@ the UI shows "try again", and the patient records still work because they don't 
 **What would you add next?**
 A real user database or hospital SSO, login rate limiting, Flyway database migrations instead of
 `ddl-auto=update`, a persistent summary cache, and an evaluation set to measure summary quality.
+
+---
+
+## 9. Concurrency: loading a patient with parallel FHIR calls
+
+**The problem.** Opening one patient needs 3 searches on the FHIR server: conditions, medicines,
+test results. They don't depend on each other. Done one after another, the doctor waits A + B + C.
+
+**The fix.** `PatientService` first reads the patient (so an unknown id gets a fast 404), then gives the
+3 searches to `FhirWorkers`, which runs them **at the same time**. Now the wait is only the slowest one.
+
+```java
+List<Callable<List<ClinicalItem>>> searches = List.of(
+        () -> ...conditions...,
+        () -> ...medicines...,
+        () -> ...observations...);
+List<List<ClinicalItem>> results = workers.runAll(searches);   // same order as the list
+```
+
+Inside `FhirWorkers`:
+
+| Piece | What it does | Why |
+|-------|--------------|-----|
+| `Executors.newFixedThreadPool(6, ...)` | 6 reusable worker threads named `fhir-worker-1..6` | creating a thread per request is slow; a **fixed** size means a busy moment can't open hundreds of connections to FHIR |
+| `pool.invokeAll(tasks, 20, SECONDS)` | starts every task, waits for all, cancels any still running after 20 s | one stuck call can't hang the request forever |
+| `Future.get()` | gets each result, in task order | the results list matches the task list |
+| `ExecutionException` → `getCause()` | throws the task's own exception | `ApiExceptionHandler` still maps "FHIR down" to 503, not a vague 500 |
+| `CancellationException` → `FhirTimeoutException` | a timed-out task | becomes HTTP **504** |
+| `InterruptedException` → `Thread.currentThread().interrupt()` | keeps the interrupt flag | the standard rule: never swallow an interrupt |
+| `destroy()` → `shutdownNow()` | stops the threads when the app stops | no leaked threads |
+
+**Is it thread-safe?** Each task only reads from FHIR and builds its **own** new list, so the threads share no
+changing data. The HAPI FHIR client is made to be shared between threads (it uses a connection pool).
+
+**Proof it works (real run, 2026-11-19):** 3 patient loads = 9 FHIR tasks. The tasks' times added up to about
+6.0 s, but the 3 loads took only 2.4 s in total, because the searches overlapped.
+
+---
+
+## 10. Monitoring: health checks, metrics and AWS CloudWatch
+
+**Health check: `GET /actuator/health`** (Spring Boot Actuator)
+- `UP` (200) or `DOWN` (503). It checks PostgreSQL and the FHIR server (`FhirHealthIndicator` asks FHIR
+  for just the patient count with `_summary=count`, which is cheap).
+- Open to everyone, so load balancers and uptime monitors can call it, but it shows **only** UP/DOWN.
+  An ADMIN token shows which part is down and why.
+
+**Metrics: `GET /actuator/metrics/...`** (Micrometer, ADMIN only)
+- `caresummary.patient.load`: how long loading a patient takes, with the tag `outcome=success|error`
+  (a `Timer` started before and stopped in a `finally`, so failures are measured too).
+- `executor`, `executor.active`, `executor.queued`, `executor.pool.core` with the tag `name=fhir.workers`:
+  the thread pool (`ExecutorServiceMetrics.monitor` wraps the pool).
+- Plus the automatic ones: HTTP requests, JVM memory, garbage collection, database connections.
+
+**AWS CloudWatch** (`CloudWatchMetricsConfig`, off unless `CLOUDWATCH_ENABLED=true`)
+- Micrometer's CloudWatch registry sends metrics to AWS every minute (`PutMetricData`). In the AWS console:
+  CloudWatch → Metrics → `CareSummaryAI` → graphs, and you can add an **alarm** (e.g. email me if the average
+  load time is over 3 s).
+- Only `caresummary.*` metrics are sent (a `MeterFilter`). Each custom metric costs money after the free 10,
+  and JVM/HTTP metrics would be dozens. The patient timer is 2 outcomes × 4 statistics = 8 metrics: inside the free tier.
+- A local `SimpleMeterRegistry` runs next to it (Spring Boot joins the two), so `/actuator/metrics` still shows everything.
+- AWS keys come from `.env` (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) or the normal AWS login on the PC.
+
+**Turn it on (about 10 minutes, free tier):**
+1. AWS console → IAM → Users → Create user `caresummary-metrics` (no console access).
+2. Permissions → Create inline policy (JSON):
+   `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"cloudwatch:PutMetricData","Resource":"*"}]}`
+   (only this one action: least privilege).
+3. Security credentials → Create access key → "Application running outside AWS".
+4. Put them in `.env`: `CLOUDWATCH_ENABLED=true`, `AWS_REGION=ap-south-1`, `AWS_ACCESS_KEY_ID=...`, `AWS_SECRET_ACCESS_KEY=...`
+5. Start the app, open a few patients, wait 1–2 minutes → CloudWatch → Metrics → All metrics → `CareSummaryAI`.
+
+---
+
+## 11. Interview questions: concurrency and monitoring
+
+**Why a thread pool and not `new Thread()` each time?**
+Threads are expensive to create. A pool reuses them, and a fixed size limits how many FHIR calls run at once,
+so we protect the FHIR server and our memory.
+
+**What is the difference between `Runnable` and `Callable`?**
+`Runnable` returns nothing and can't throw checked exceptions. `Callable<T>` returns a value and can throw.
+I need the results, so I used `Callable`.
+
+**What is a `Future`?**
+A "ticket" for a result that will be ready later. `get()` waits for it. If the task failed, `get()` throws
+`ExecutionException`, and the real error is inside it (`getCause()`).
+
+**Why not `CompletableFuture`?**
+It also works (`supplyAsync(..., pool)`, then `allOf(...).join()`). `invokeAll` with a timeout was simpler
+for "run these N tasks, wait for all, give up after 20 s". `CompletableFuture` is better when you chain steps
+("when A finishes, do B").
+
+**What is a race condition? Could you have one here?**
+Two threads changing the same data at the same time, so the result depends on timing. Here each task builds its
+own new list and shares nothing that changes, so there is no race. If they shared a list, I would use a
+thread-safe collection or a lock.
+
+**What is a deadlock?**
+Two threads each waiting for something the other one holds, so both wait forever. Our tasks don't wait for each
+other or hold locks, and there is a timeout anyway.
+
+**What happens if FHIR is down or slow?**
+Down: the task throws `FhirClientConnectionException`, I re-throw that same exception, and the user gets 503.
+Slow: after 20 s `invokeAll` cancels the task and the user gets 504. The health check also turns DOWN.
+
+**Why is `/actuator/health` public but without details?**
+Monitors and load balancers must call it without logging in. The details (error messages, database type)
+could help an attacker, so only ADMIN sees them.
+
+**Why not send all metrics to CloudWatch?**
+Cost and noise. Each custom metric is billed after the free tier, so I filter to the ones that matter for this
+app: patient load time and errors.
+
+**Metrics vs logs vs traces?**
+Metrics = numbers over time (how slow, how many errors) for graphs and alarms. Logs = what happened in one
+request. Traces = one request's path across services. Here I added metrics and health checks.

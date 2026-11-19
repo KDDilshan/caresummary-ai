@@ -2,6 +2,7 @@ package com.kavindu.caresummaryapi.common;
 
 import ca.uhn.fhir.rest.client.exceptions.FhirClientConnectionException;
 import com.kavindu.caresummaryapi.ai.AiUnavailableException;
+import com.kavindu.caresummaryapi.patient.FhirTimeoutException;
 import com.kavindu.caresummaryapi.patient.PatientNotFoundException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -42,6 +43,12 @@ public class ApiExceptionHandler {
     @ExceptionHandler(AiUnavailableException.class)
     public ProblemDetail aiDown(AiUnavailableException e) {
         return ProblemDetail.forStatusAndDetail(HttpStatus.SERVICE_UNAVAILABLE, e.getMessage());
+    }
+
+    @ExceptionHandler(FhirTimeoutException.class)
+    public ProblemDetail fhirSlow(FhirTimeoutException e) {
+        log.error("FHIR server too slow: {}", e.getMessage());
+        return ProblemDetail.forStatusAndDetail(HttpStatus.GATEWAY_TIMEOUT, e.getMessage());
     }
 
     @ExceptionHandler(FhirClientConnectionException.class)

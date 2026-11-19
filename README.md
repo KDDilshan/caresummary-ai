@@ -16,6 +16,8 @@ and the API **checks those citations against the real records** before showing t
 - **Privacy**: the AI never receives the patient's name, ID or birth date, only age, gender and clinical facts
 - **Login with JWT** and two roles: `DOCTOR` (patients + AI) and `ADMIN` (audit log only, no patient data)
 - **Audit log** in PostgreSQL: every login, patient view and AI request (who, what, when)
+- **Parallel FHIR calls**: a patient's conditions, medicines and test results are fetched at the same time on a fixed thread pool (`ExecutorService.invokeAll`, 20 s timeout), so the wait is the slowest call, not all three added up
+- **Monitoring**: Spring Boot Actuator health check (database + FHIR server, `503` when one is down), Micrometer metrics (patient load time, thread pool), and optional export to **AWS CloudWatch**
 - **CI** with GitHub Actions: API tests and UI type-check/build on every push
 
 ## Architecture
@@ -45,8 +47,10 @@ HAPI FHIR server (:8090, Docker) ◄── Synthea fake patients
 | POST | `/api/patients/{id}/ask` `{"question": "..."}` | DOCTOR | AI answer with checked sources |
 | GET | `/api/ai/status` | DOCTOR | is the AI configured? |
 | GET | `/api/audit?patientId=` | ADMIN | latest 200 audit events |
+| GET | `/actuator/health` | anyone (details: ADMIN) | `UP` / `DOWN` for the database and FHIR server |
+| GET | `/actuator/metrics/{name}` | ADMIN | metrics, e.g. `caresummary.patient.load`, `executor` |
 
-Errors are JSON "problem details": `400` bad input, `401` not logged in, `403` wrong role, `404` unknown patient, `503` FHIR server or AI unavailable.
+Errors are JSON "problem details": `400` bad input, `401` not logged in, `403` wrong role, `404` unknown patient, `503` FHIR server or AI unavailable, `504` FHIR server too slow.
 
 ## Run it locally
 
@@ -94,11 +98,11 @@ cd caresummary-api
 ./mvnw test
 ```
 
-23 tests: FHIR mapping, the source checker (hallucination guard), privacy of the AI input, and API security (login, roles, 401/403, validation, audit log). Tests use an in-memory H2 database and mocks, so no Docker or AI key is needed.
+34 tests: FHIR mapping, the source checker (hallucination guard), privacy of the AI input, API security (login, roles, 401/403, validation, audit log), the parallel worker pool (runs at the same time, keeps order, passes errors on, times out), the CloudWatch metric filter, and the monitoring endpoints. Tests use an in-memory H2 database and mocks, so no Docker or AI key is needed.
 
 ## Tech
 
-Java 17 · Spring Boot 4 · Spring Security (JWT) · Spring AI 2 · Google Gemini · HAPI FHIR 8 · Spring Data JPA · PostgreSQL · React 19 · TypeScript · Vite · Docker Compose · JUnit 5 · Mockito · GitHub Actions
+Java 17 · Spring Boot 4 · Java concurrency (`ExecutorService`) · Spring Boot Actuator · Micrometer · AWS CloudWatch · Spring Security (JWT) · Spring AI 2 · Google Gemini · HAPI FHIR 8 · Spring Data JPA · PostgreSQL · React 19 · TypeScript · Vite · Docker Compose · JUnit 5 · Mockito · GitHub Actions
 
 ## Limits (honest list)
 
