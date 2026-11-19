@@ -14,12 +14,15 @@ import org.hl7.fhir.r4.model.MedicationRequest;
 import org.hl7.fhir.r4.model.Observation;
 import org.hl7.fhir.r4.model.Patient;
 import org.hl7.fhir.r4.model.Resource;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.concurrent.Callable;
 import java.util.function.Function;
 
 /**
@@ -34,10 +37,18 @@ public class PatientService {
     static final int MAX_ITEMS = 500;
     static final int RECENT_OBSERVATIONS = 40;
 
-    private final IGenericClient fhir;
+    /** Metric name. Only "caresummary.*" metrics are sent to AWS CloudWatch (see CloudWatchMetricsConfig). */
+    static final String LOAD_METRIC = "caresummary.patient.load";
 
-    public PatientService(IGenericClient fhir) {   // Spring injects the bean from FhirConfig
+    private final IGenericClient fhir;
+    private final FhirWorkers workers;
+    private final MeterRegistry metrics;
+
+    // Spring injects: the FHIR client (FhirConfig), the worker pool (FhirWorkers), the metrics registry (Actuator)
+    public PatientService(IGenericClient fhir, FhirWorkers workers, MeterRegistry metrics) {
         this.fhir = fhir;
+        this.workers = workers;
+        this.metrics = metrics;
     }
 
     /** GET Patient?name=... : all patients, or those whose name starts with the search text. */
@@ -55,8 +66,25 @@ public class PatientService {
                 .toList();
     }
 
-    /** One patient with their illnesses, medicines and latest test results. */
+    /**
+     * One patient with their illnesses, medicines and latest test results.
+     * The time it takes is recorded as the metric "caresummary.patient.load" (outcome = success / error).
+     */
     public PatientDetail getPatient(String id) {
+        Timer.Sample sample = Timer.start(metrics);   // start the stopwatch
+        String outcome = "error";
+        try {
+            PatientDetail detail = loadPatient(id);
+            outcome = "success";
+            return detail;
+        } finally {
+            // "finally" runs even when an exception is thrown, so failed loads are counted too
+            sample.stop(metrics.timer(LOAD_METRIC, "outcome", outcome));
+        }
+    }
+
+    private PatientDetail loadPatient(String id) {
+        // 1) Read the patient first. If they don't exist we answer 404 at once, without starting 3 searches.
         Patient patient;
         try {
             patient = fhir.read().resource(Patient.class).withId(id).execute();
@@ -66,26 +94,40 @@ public class PatientService {
 
         String subject = "Patient/" + id;
 
-        Bundle conditionBundle = fhir.search().forResource(Condition.class)
+        // 2) The 3 searches don't depend on each other, so they run AT THE SAME TIME on the worker threads.
+        List<Callable<List<ClinicalItem>>> searches = List.of(
+                () -> newestFirst(fetchAll(searchConditions(subject), Condition.class, MAX_ITEMS), FhirMapper::toItem),
+                () -> newestFirst(fetchAll(searchMedications(subject), MedicationRequest.class, MAX_ITEMS), FhirMapper::toItem),
+                () -> newestFirst(resourcesIn(searchObservations(subject), Observation.class), FhirMapper::toItem));
+
+        List<List<ClinicalItem>> results = workers.runAll(searches);   // same order as the list above
+
+        return new PatientDetail(
+                FhirMapper.toSummary(patient, LocalDate.now()),
+                results.get(0),    // conditions
+                results.get(1),    // medicines
+                results.get(2));   // observations
+    }
+
+    private Bundle searchConditions(String subject) {
+        return fhir.search().forResource(Condition.class)
                 .where(Condition.SUBJECT.hasId(subject))
                 .count(200).returnBundle(Bundle.class).execute();
+    }
 
-        Bundle medicationBundle = fhir.search().forResource(MedicationRequest.class)
+    private Bundle searchMedications(String subject) {
+        return fhir.search().forResource(MedicationRequest.class)
                 .where(MedicationRequest.SUBJECT.hasId(subject))
                 .count(200).returnBundle(Bundle.class).execute();
+    }
 
-        // Only the newest vital signs and lab results (not surveys): a patient can have thousands
-        Bundle observationBundle = fhir.search().forResource(Observation.class)
+    /** Only the newest vital signs and lab results (not surveys): a patient can have thousands. */
+    private Bundle searchObservations(String subject) {
+        return fhir.search().forResource(Observation.class)
                 .where(Observation.SUBJECT.hasId(subject))
                 .and(Observation.CATEGORY.exactly().codes("vital-signs", "laboratory"))
                 .sort().descending(Observation.DATE)
                 .count(RECENT_OBSERVATIONS).returnBundle(Bundle.class).execute();
-
-        return new PatientDetail(
-                FhirMapper.toSummary(patient, LocalDate.now()),
-                newestFirst(fetchAll(conditionBundle, Condition.class, MAX_ITEMS), FhirMapper::toItem),
-                newestFirst(fetchAll(medicationBundle, MedicationRequest.class, MAX_ITEMS), FhirMapper::toItem),
-                newestFirst(resourcesIn(observationBundle, Observation.class), FhirMapper::toItem));
     }
 
     // ---------- helpers ----------

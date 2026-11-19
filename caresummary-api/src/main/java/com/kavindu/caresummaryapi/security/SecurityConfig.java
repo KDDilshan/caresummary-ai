@@ -41,6 +41,7 @@ import java.util.List;
  *  - POST /api/auth/login        : anyone (this is where you get a token)
  *  - /api/patients/**, /api/ai/**: DOCTOR only (patient data)
  *  - /api/audit/**               : ADMIN only (the admin sees the log, not patient records)
+ *  - GET /actuator/health        : anyone (only UP/DOWN); other /actuator/** (metrics): ADMIN only
  * Every other request needs a valid JWT in the "Authorization: Bearer ..." header.
  */
 @Configuration
@@ -58,6 +59,10 @@ public class SecurityConfig {
                 .authorizeHttpRequests(auth -> auth
                         .requestMatchers(HttpMethod.POST, "/api/auth/login").permitAll()
                         .requestMatchers("/error").permitAll()
+                        // Health check is open (load balancers and uptime monitors call it without a login).
+                        // It shows only UP/DOWN; the details are for ADMIN (see application.properties).
+                        .requestMatchers(HttpMethod.GET, "/actuator/health").permitAll()
+                        .requestMatchers("/actuator/**").hasRole("ADMIN")
                         .requestMatchers("/api/audit/**").hasRole("ADMIN")
                         .requestMatchers("/api/patients/**", "/api/ai/**").hasRole("DOCTOR")
                         .anyRequest().authenticated())

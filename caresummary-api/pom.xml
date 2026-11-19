@@ -96,6 +96,17 @@
 			<artifactId>spring-boot-starter-validation</artifactId>
 		</dependency>
 
+		<!-- Monitoring: /actuator/health and /actuator/metrics (Micrometer is included) -->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-actuator</artifactId>
+		</dependency>
+		<!-- Sends our app metrics to AWS CloudWatch (only when CLOUDWATCH_ENABLED=true) -->
+		<dependency>
+			<groupId>io.micrometer</groupId>
+			<artifactId>micrometer-registry-cloudwatch2</artifactId>
+		</dependency>
+
 		<!-- Tests -->
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
