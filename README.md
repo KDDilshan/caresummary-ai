@@ -14,8 +14,9 @@ and the API **checks those citations against the real records** before showing t
 - **Ask a question** about one patient. The answer uses only that patient's records.
 - **Hallucination check**: sources the AI invents are removed, and lines without a real source are flagged ⚠
 - **Privacy**: the AI never receives the patient's name, ID or birth date, only age, gender and clinical facts
-- **Login with JWT** and two roles: `DOCTOR` (patients + AI) and `ADMIN` (audit log only, no patient data)
-- **Audit log** in PostgreSQL: every login, patient view and AI request (who, what, when)
+- **Single sign-on with Keycloak (OAuth 2.0 + OpenID Connect)**: the React app uses the Authorization Code flow with **PKCE**, `state` and `nonce`; the API is an OAuth 2.0 **resource server** that never sees a password and checks every token's RS256 signature (JWKS), issuer, **audience** and expiry. Logout ends the Keycloak session too.
+- **Two roles** from Keycloak realm roles: `DOCTOR` (patients + AI) and `ADMIN` (audit log only, no patient data). A user with no role can log in but gets `403` everywhere.
+- **Audit log** in PostgreSQL: every patient view and AI request (who, what, when). Logins and failed logins are in Keycloak's event log.
 - **Parallel FHIR calls**: a patient's conditions, medicines and test results are fetched at the same time on a fixed thread pool (`ExecutorService.invokeAll`, 20 s timeout), so the wait is the slowest call, not all three added up
 - **Monitoring**: Spring Boot Actuator health check (database + FHIR server, `503` when one is down), Micrometer metrics (patient load time, thread pool), and optional export to **AWS CloudWatch**
 - **CI** with GitHub Actions: API tests and UI type-check/build on every push
@@ -23,10 +24,10 @@ and the API **checks those citations against the real records** before showing t
 ## Architecture
 
 ```
-React UI (Vite, :5173)
-      │  JWT in "Authorization: Bearer ..."
-      ▼
-Spring Boot API (:8080) ──── Spring Security (JWT, roles)
+React UI (Vite, :5173) ── login (OIDC Code + PKCE) ──► Keycloak (:8180, Docker)
+      │  access token in "Authorization: Bearer ..."       users, roles, login page, RS256 tokens
+      ▼                                                          ▲
+Spring Boot API (:8080) ──── Spring Security resource server ────┘ public keys (JWKS): check signature, iss, aud, exp
       │        │        └── Audit log ──► PostgreSQL (:5432)
       │        └── Spring AI ──► Google Gemini   (facts only, no name/ID)
       ▼
@@ -39,8 +40,9 @@ HAPI FHIR server (:8090, Docker) ◄── Synthea fake patients
 
 | Method | Path | Role | Returns |
 |--------|------|------|---------|
-| POST | `/api/auth/login` | anyone | JWT token + roles |
-| GET | `/api/auth/me` | any logged-in user | username + roles |
+| GET | `/api/auth/config` | anyone | login mode, Keycloak issuer and client id |
+| GET | `/api/auth/me` | any logged-in user | username + roles, as the API sees them |
+| POST | `/api/auth/login` | anyone, **local mode only** | JWT token + roles |
 | GET | `/api/patients?name=` | DOCTOR | patient list (optional name search) |
 | GET | `/api/patients/{id}` | DOCTOR | patient + conditions + medicines + latest vitals/labs |
 | POST | `/api/patients/{id}/summary?refresh=false` | DOCTOR | AI summary with checked sources |
@@ -56,7 +58,7 @@ Errors are JSON "problem details": `400` bad input, `401` not logged in, `403` w
 
 Needs: Java 17+, Node 20+, Docker Desktop.
 
-**1. Start the FHIR server and PostgreSQL**
+**1. Start the FHIR server, PostgreSQL and Keycloak** (Keycloak loads its realm, client and demo users from `keycloak/caresummary-realm.json`; first start takes about a minute)
 
 ```bash
 docker compose up -d
@@ -89,7 +91,9 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:5173 and log in as `doctor` / `doctor123` or `admin` / `admin123`. These are local demo passwords; change them in `.env`.
+Open http://localhost:5173, click **Log in with Keycloak** and sign in on Keycloak's page as `doctor` / `doctor123`, `admin` / `admin123`, or `nurse` / `nurse123` (no role). These are local demo users only. Keycloak admin console: http://localhost:8180 (`admin` / `admin`).
+
+No Docker memory for Keycloak? Set `AUTH_MODE=local` in `.env` to use the old built-in login form (same demo users, no `nurse`).
 
 ## Tests
 
@@ -98,17 +102,18 @@ cd caresummary-api
 ./mvnw test
 ```
 
-34 tests: FHIR mapping, the source checker (hallucination guard), privacy of the AI input, API security (login, roles, 401/403, validation, audit log), the parallel worker pool (runs at the same time, keeps order, passes errors on, times out), the CloudWatch metric filter, and the monitoring endpoints. Tests use an in-memory H2 database and mocks, so no Docker or AI key is needed.
+52 tests: FHIR mapping, the source checker (hallucination guard), privacy of the AI input, API security (login, roles, 401/403, validation, audit log), Keycloak token rules (real RS256 tokens: wrong key, wrong issuer, wrong audience, expired → rejected), Keycloak role mapping, the parallel worker pool (runs at the same time, keeps order, passes errors on, times out), the CloudWatch metric filter, and the monitoring endpoints. Tests use an in-memory H2 database and mocks, so no Docker or AI key is needed.
 
 ## Tech
 
-Java 17 · Spring Boot 4 · Java concurrency (`ExecutorService`) · Spring Boot Actuator · Micrometer · AWS CloudWatch · Spring Security (JWT) · Spring AI 2 · Google Gemini · HAPI FHIR 8 · Spring Data JPA · PostgreSQL · React 19 · TypeScript · Vite · Docker Compose · JUnit 5 · Mockito · GitHub Actions
+Java 17 · Spring Boot 4 · Java concurrency (`ExecutorService`) · Spring Boot Actuator · Micrometer · AWS CloudWatch · Spring Security (OAuth 2.0 resource server, JWT) · Keycloak · OpenID Connect · PKCE · Spring AI 2 · Google Gemini · HAPI FHIR 8 · Spring Data JPA · PostgreSQL · React 19 · TypeScript · Vite · Docker Compose · JUnit 5 · Mockito · GitHub Actions
 
 ## Limits (honest list)
 
-- Demo users live in memory; a real system would use a user database or hospital single sign-on.
+- Keycloak runs in dev mode (plain HTTP, built-in database). Production needs HTTPS, `start` mode and a real database.
+- The access token is kept in `sessionStorage`; a production health app should use a backend-for-frontend with `HttpOnly` cookies. No silent token refresh yet (log in again after 30 minutes; Keycloak remembers you, so no password).
 - The summary cache is in memory and resets on restart.
-- No rate limiting on login yet.
+- No rate limiting on the API (Keycloak locks an account after 5 wrong passwords).
 - Only a sample of each record is sent to the AI (up to 60 conditions, 60 medicines, 40 latest results).
 
 See [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md) for a plain-English walkthrough and interview questions.
