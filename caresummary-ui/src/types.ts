@@ -50,8 +50,12 @@ export interface AuditEvent {
 }
 
 export interface Session {
-  token: string
+  token: string // access token, sent to the API as "Authorization: Bearer <token>"
   username: string
   roles: string[]
   expiresAt: string
+  idToken?: string // keycloak mode only: used to log out of Keycloak too
 }
+
+// From GET /api/auth/config: which login to show
+export type AuthConfig = { mode: 'local' } | { mode: 'keycloak'; issuer: string; clientId: string }

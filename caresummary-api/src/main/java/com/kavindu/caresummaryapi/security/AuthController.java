@@ -1,72 +1,56 @@
 package com.kavindu.caresummaryapi.security;
 
-import com.kavindu.caresummaryapi.audit.AuditEvent.Action;
-import com.kavindu.caresummaryapi.audit.AuditService;
-import jakarta.validation.Valid;
-import jakarta.validation.constraints.NotBlank;
-import jakarta.validation.constraints.Size;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ProblemDetail;
-import org.springframework.security.authentication.AuthenticationManager;
-import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.core.Authentication;
-import org.springframework.security.core.AuthenticationException;
-import org.springframework.security.oauth2.jwt.Jwt;
-import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.security.core.GrantedAuthority;
 import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
-import org.springframework.security.core.annotation.AuthenticationPrincipal;
 
 import java.util.List;
 import java.util.Map;
 
 /**
- *   POST /api/auth/login {"username","password"} -> {"token","roles","expiresAt"}
- *   GET  /api/auth/me                            -> who am I (needs a token)
+ *   GET /api/auth/config -> which login the React app should show (anyone)
+ *   GET /api/auth/me     -> who am I, as the API sees me (needs a token)
  */
 @RestController
 @RequestMapping("/api/auth")
 public class AuthController {
 
-    public record LoginRequest(@NotBlank @Size(max = 100) String username,
-                               @NotBlank @Size(max = 200) String password) {
+    private final String mode;
+    private final String issuer;
+    private final String clientId;
+
+    public AuthController(@Value("${" + SecurityConfig.MODE + ":keycloak}") String mode,
+                          @Value("${app.security.keycloak.issuer-uri:}") String issuer,
+                          @Value("${app.security.keycloak.ui-client-id:caresummary-ui}") String clientId) {
+        this.mode = mode;
+        this.issuer = issuer;
+        this.clientId = clientId;
     }
 
-    private final AuthenticationManager authManager;
-    private final TokenService tokens;
-    private final AuditService audit;
-
-    public AuthController(AuthenticationManager authManager, TokenService tokens, AuditService audit) {
-        this.authManager = authManager;
-        this.tokens = tokens;
-        this.audit = audit;
-    }
-
-    @PostMapping("/login")
-    public TokenService.Token login(@Valid @RequestBody LoginRequest req) {
-        try {
-            Authentication auth = authManager.authenticate(
-                    new UsernamePasswordAuthenticationToken(req.username(), req.password()));
-            audit.record(auth.getName(), Action.LOGIN_SUCCESS, null, null);
-            return tokens.create(auth);
-        } catch (AuthenticationException e) {
-            audit.record(req.username(), Action.LOGIN_FAILED, null, null);
-            throw e;
+    /** Public settings only (no secrets): the React app uses them to start the OpenID Connect login. */
+    @GetMapping("/config")
+    public Map<String, String> config() {
+        if ("local".equals(mode)) {
+            return Map.of("mode", "local");
         }
+        return Map.of("mode", "keycloak", "issuer", issuer, "clientId", clientId);
     }
 
+    /**
+     * The UI calls this right after login. It shows the user and roles AFTER our API checked the token,
+     * so the UI shows exactly what the API will allow (it does not trust its own reading of the token).
+     */
     @GetMapping("/me")
-    public Map<String, Object> me(@AuthenticationPrincipal Jwt jwt) {
-        List<String> roles = jwt.getClaimAsStringList("roles");
-        return Map.of("username", jwt.getSubject(), "roles", roles == null ? List.of() : roles);
-    }
-
-    /** Same message for wrong username and wrong password, so attackers can't learn which usernames exist. */
-    @ExceptionHandler(AuthenticationException.class)
-    public ProblemDetail badLogin() {
-        return ProblemDetail.forStatusAndDetail(HttpStatus.UNAUTHORIZED, "Wrong username or password");
+    public Map<String, Object> me(Authentication user) {
+        List<String> roles = user.getAuthorities().stream()
+                .map(GrantedAuthority::getAuthority)
+                .filter(a -> a.startsWith("ROLE_"))
+                .map(a -> a.substring("ROLE_".length()))
+                .sorted()
+                .toList();
+        return Map.of("username", user.getName(), "roles", roles);
     }
 }

@@ -77,6 +77,17 @@ class ApiSecurityTest {
     }
 
     @Test
+    void config_saysLocalMode_andMeWorksWithLocalToken() throws Exception {
+        mvc.perform(get("/api/auth/config"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.mode").value("local"));
+        mvc.perform(get("/api/auth/me").header("Authorization", login("admin", "admin-test-pw")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.username").value("admin"))
+                .andExpect(jsonPath("$.roles[0]").value("ADMIN"));
+    }
+
+    @Test
     void noToken_is401() throws Exception {
         mvc.perform(get("/api/patients")).andExpect(status().isUnauthorized());
     }

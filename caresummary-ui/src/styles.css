@@ -51,6 +51,7 @@ input:focus { outline: 2px solid var(--brand-soft); border-color: var(--brand); 
   border-radius: 14px; padding: 28px; display: flex; flex-direction: column; gap: 14px;
 }
 .login-card h1 span, .brand span { color: var(--brand); }
+.login-form { display: flex; flex-direction: column; gap: 14px; }
 .login-card label { display: flex; flex-direction: column; gap: 6px; font-size: 0.9rem; }
 .hint { font-size: 0.82rem; color: var(--muted); margin: 0; }
 

@@ -51,6 +51,9 @@ Only fake patients are used.
 
 ## 4. Login (JWT) in simple words
 
+> **Now:** the default login is **Keycloak** (OAuth 2.0 + OpenID Connect), explained in **section 12**.
+> This section is the older built-in login, still there as `AUTH_MODE=local` for running without Keycloak.
+
 - `POST /api/auth/login` with username + password.
 - `AuthenticationManager` checks the password against a **BCrypt hash** (passwords are never stored as plain text).
 - `TokenService` makes a **JWT**: a signed text containing *who* (`sub`), *roles*, and *expiry* (60 min).
@@ -85,9 +88,13 @@ caresummary-api/src/main/java/com/kavindu/caresummaryapi/
 │   ├── SourceChecker.java     the hallucination check
 │   └── AiAnswer.java          JSON shape we ask the AI for
 ├── security/
-│   ├── SecurityConfig.java    who can call what, JWT encoder/decoder, users, CORS
-│   ├── TokenService.java      makes JWTs
-│   └── AuthController.java    login, /me
+│   ├── SecurityConfig.java        who can call what (same rules in both login modes), CORS
+│   ├── KeycloakConfig.java        keycloak mode: check Keycloak tokens (signature, iss, aud, exp)
+│   ├── KeycloakRoleConverter.java keycloak mode: realm_access.roles -> ROLE_DOCTOR / ROLE_ADMIN
+│   ├── LocalLoginConfig.java      local mode: in-memory users, BCrypt, our own HS256 tokens
+│   ├── LocalLoginController.java  local mode: POST /api/auth/login
+│   ├── TokenService.java          local mode: makes JWTs
+│   └── AuthController.java        GET /api/auth/config, /api/auth/me
 ├── audit/                     AuditEvent (JPA entity), repository, service, controller
 ├── monitoring/
 │   ├── FhirHealthIndicator.java      adds "fhir" UP/DOWN to /actuator/health
@@ -97,7 +104,7 @@ caresummary-api/src/main/java/com/kavindu/caresummaryapi/
 
 ---
 
-## 6. Tests (34)
+## 6. Tests (52)
 
 | Test | What it proves |
 |------|----------------|
@@ -107,7 +114,10 @@ caresummary-api/src/main/java/com/kavindu/caresummaryapi/
 | `FhirWorkersTest` | tasks really run at the same time (3 × 400 ms finish in under 1 s), on different threads; results keep their order; a task's error is passed on; a stuck task times out; the pool is measured |
 | `CloudWatchFilterTest` | only `caresummary.*` metrics would be sent to CloudWatch |
 | `ActuatorTest` | health is open but shows only UP/DOWN; admin sees which part is down; metrics need ADMIN; the thread pool shows up in metrics |
-| `ApiSecurityTest` | no token → 401; fake token → 401; doctor can't see audit; admin can't see patients; bad id → 400; unknown → 404; logins and views are audited |
+| `ApiSecurityTest` | (local login mode) no token → 401; fake token → 401; doctor can't see audit; admin can't see patients; bad id → 400; unknown → 404; logins and views are audited |
+| `KeycloakTokenValidationTest` | real RS256 tokens signed by a test key: good token passes; token signed by another key, from another realm (`iss`), for another app (`aud`, e.g. an ID token), with no `aud`, or expired → rejected |
+| `KeycloakRoleConverterTest` | only `DOCTOR` / `ADMIN` from `realm_access.roles` become roles; Keycloak's built-in roles are ignored; no claim = no roles; names must match exactly |
+| `KeycloakModeApiTest` | (keycloak mode) `/api/auth/config` is public; audit log shows `doctor`, not the Keycloak user id; a user with no role can log in but gets 403 everywhere; rejected token → 401; there is no password login endpoint |
 
 Tests use **H2** (an in-memory database) and **Mockito mocks** for FHIR and the AI, so they run anywhere,
 including GitHub Actions, without Docker or an API key.
@@ -300,3 +310,190 @@ app: patient load time and errors.
 **Metrics vs logs vs traces?**
 Metrics = numbers over time (how slow, how many errors) for graphs and alarms. Logs = what happened in one
 request. Traces = one request's path across services. Here I added metrics and health checks.
+
+---
+
+## 12. Login with Keycloak (OAuth 2.0 + OpenID Connect)
+
+### The big idea
+
+Before, our API did everything: kept the users, checked passwords, made tokens. Now that job moves to
+**Keycloak**, a separate login server (an "identity provider", like the ones big companies use for single sign-on).
+
+| Word | In this app | Simple meaning |
+|------|-------------|----------------|
+| **Authorization server / identity provider** | Keycloak (`:8180`) | Keeps users, passwords, roles. Shows the login page. Gives out signed tokens. |
+| **Client** | React app, client id `caresummary-ui` | The app that wants a token for the user. |
+| **Resource server** | Our Spring Boot API | Holds the data. Accepts a request only with a valid token. |
+| **Realm** | `caresummary` | One separate "space" in Keycloak: its own users, roles, clients. |
+| **OAuth 2.0** | | The rules for getting an **access token** (what you are allowed to call). |
+| **OpenID Connect (OIDC)** | | A layer on top of OAuth 2.0 that also says **who you are** (the **ID token**) and adds discovery, nonce and logout. |
+
+Why this is better:
+- **Our API never sees a password.** No password database to leak, no login endpoint to attack.
+- **One login for many apps** (single sign-on). Add a second app, and users don't make a new account.
+- **Keycloak gives us** password hashing, brute-force lock-out (5 tries), login event logs, password reset, MFA
+  and "log in with Google/Microsoft" (we don't use those, but they are one setting away).
+- **Tokens are signed with a private key (RS256).** Our API only needs the *public* key, so it can't make tokens,
+  only check them. With the old shared secret (HS256), anyone who can check tokens can also make them.
+
+### The login flow, step by step (Authorization Code + PKCE)
+
+```
+ Browser (React :5173)                Keycloak (:8180)                    API (:8080)
+ 1. click "Log in with Keycloak"
+    make verifier, state, nonce
+    challenge = SHA-256(verifier)
+    -- redirect: /auth?client_id&redirect_uri&state&nonce&code_challenge -->
+                                      2. login page, user types password
+                                         (password checked HERE only)
+    <-- redirect: localhost:5173/?code=XYZ&state=... --
+ 3. state the same as I sent? yes
+    POST /token: code + verifier --->  4. SHA-256(verifier) == challenge?
+                                         code works once, short life
+    <-- access token + ID token --
+ 5. nonce in ID token the same? yes
+ 6. GET /api/auth/me   Authorization: Bearer <access token> --------------->  7. check token:
+                                                                              signature (JWKS public key),
+                                                                              iss, exp, aud = caresummary-api
+    <------------------------------- {"username":"doctor","roles":["DOCTOR"]} --
+ 8. every API call sends the same access token (30 min life)
+```
+
+File: `caresummary-ui/src/oidc.ts` (each step is commented). API side: `KeycloakConfig.java`.
+
+### Why each check exists (the security part interviewers ask about)
+
+- **PKCE (code verifier / code challenge).** A browser app can't keep a client secret (anyone can read
+  the JavaScript). Without PKCE, someone who steals the `code` (from a log, browser history, or a bad app on the phone)
+  could swap it for tokens. With PKCE, they also need the random `verifier`, which never left our browser tab.
+  We use `S256` (a hash), and Keycloak is set to **require** it for this client.
+- **`state`.** A random value we send and check when we come back. Stops an attacker from making your browser
+  finish *their* login (login CSRF).
+- **`nonce`.** A random value that Keycloak puts inside the ID token. Stops an old ID token being replayed.
+- **Signature (JWKS).** Keycloak publishes its public keys at `/realms/caresummary/protocol/openid-connect/certs`.
+  Spring downloads and caches them, and picks the right one by the token's `kid` (key id). So Keycloak can
+  **rotate keys** without us changing anything. We also allow **only RS256**, so a token saying `alg: none` or
+  `HS256` is refused.
+- **`iss` (issuer).** Must be exactly `http://localhost:8180/realms/caresummary`. A token from another realm
+  or another Keycloak is refused.
+- **`aud` (audience).** Must contain `caresummary-api`. Keycloak adds it with an "audience mapper" on the
+  `caresummary-ui` client. This stops a token made for **another app** being used against our API, and also
+  stops someone sending the **ID token** instead of the access token (the ID token's audience is `caresummary-ui`).
+- **`exp`.** Access tokens live 30 minutes (60 s clock difference allowed).
+
+### Roles: from Keycloak to `hasRole("DOCTOR")`
+
+Keycloak puts roles in a nested claim: `"realm_access": {"roles": ["DOCTOR", "offline_access", ...]}`.
+`KeycloakRoleConverter` keeps only the roles this app knows (`DOCTOR`, `ADMIN`) and turns them into
+`ROLE_DOCTOR` / `ROLE_ADMIN`. The access rules in `SecurityConfig` did not change at all.
+
+The user's name comes from `preferred_username` (`doctor`), not `sub` (a random-looking Keycloak id),
+so the audit log stays readable.
+
+**Authentication vs authorization:** Keycloak does *authentication* (who are you?). Our API still does
+*authorization* (what may you do?): the `nurse` user logs in fine but has no role, so the API answers 403 to everything.
+
+### Logout
+
+"Log out" does two things: forgets the token in our app, then sends the browser to Keycloak's
+`end_session_endpoint` with the ID token as a hint, so the **Keycloak session** ends too. Otherwise the next
+"Log in" would sign you straight back in without a password (that is single sign-on working, but not what
+"log out" should do). When a token just **expires** (401), we only forget it here; clicking "Log in" then
+uses the still-open Keycloak session, so no password is needed.
+
+### What a real (production) setup would add
+
+- **HTTPS everywhere** (Keycloak runs `start-dev` here: plain HTTP + a built-in database). Production:
+  `start` mode, PostgreSQL for Keycloak, real hostname, TLS.
+- **Token storage.** We keep the access token in `sessionStorage` (cleared when the tab closes). If an attacker
+  could run JavaScript on our page (XSS), they could read it. The stronger pattern is a **BFF**
+  (backend-for-frontend): the server keeps the tokens and the browser only gets an `HttpOnly` cookie.
+- **Refresh tokens / silent renew**, so the user isn't sent back to the login button every 30 minutes.
+- **Users from a real directory** (LDAP / Active Directory) and **MFA** for clinicians; both are Keycloak settings.
+- **Short token life + revocation:** an access token stays valid until it expires even if the user is disabled.
+  Shorter life or token introspection solves that.
+
+### Two login modes
+
+| `AUTH_MODE` | Who logs users in | Token signed with | Use it for |
+|-------------|-------------------|-------------------|-----------|
+| `keycloak` (default) | Keycloak | Keycloak's RSA private key (RS256) | normal use |
+| `local` | our API (`POST /api/auth/login`) | shared secret (HS256) | running without Docker/Keycloak, low-RAM machines |
+
+Spring picks the beans with `@ConditionalOnProperty(name = "app.security.mode", ...)`: `KeycloakConfig` or
+`LocalLoginConfig`. Each gives a `JwtDecoder` + `JwtAuthenticationConverter`; `SecurityConfig` uses whichever exists.
+
+### Where things are in Keycloak
+
+- Realm file: `keycloak/caresummary-realm.json` (loaded on first start with `--import-realm`).
+- Admin console: http://localhost:8180 (admin / admin). Realm `caresummary` -> *Users*, *Realm roles*,
+  *Clients -> caresummary-ui*, and *Events* (every login and failed login).
+- Discovery document: http://localhost:8180/realms/caresummary/.well-known/openid-configuration
+
+---
+
+## 13. Interview questions: OAuth 2.0, OpenID Connect, Keycloak
+
+**What is the difference between OAuth 2.0 and OpenID Connect?**
+OAuth 2.0 is about *authorization*: getting an access token to call an API. It does not say who the user is.
+OpenID Connect adds *authentication* on top: an ID token (a JWT about the user), a `userinfo` endpoint,
+discovery and logout. I use both: the ID token for the login check (nonce) and logout, the access token for the API.
+
+**Access token vs ID token?**
+The access token is for the **API** (audience `caresummary-api`); the API checks it on every call.
+The ID token is for the **client app**, to know who logged in. Never send the ID token to an API; my API rejects
+it because its audience is wrong.
+
+**Why Authorization Code + PKCE and not the Implicit flow?**
+Implicit put tokens straight in the URL, where they leak to history and logs. It is no longer recommended
+(OAuth 2.0 Security Best Current Practice). Code + PKCE returns only a one-time code in the URL, and the code
+is useless without the verifier.
+
+**Why not the "password" grant (send username + password to Keycloak's token endpoint)?**
+Then our app sees the password again, which defeats the point, and it can't do MFA or SSO. It is deprecated.
+I turned it off for this client (`directAccessGrantsEnabled: false`).
+
+**What is a public client vs a confidential client?**
+A confidential client (a server) can keep a client secret. A public client (browser or mobile app) can't,
+because users can read its code. My React app is a public client, so it must use PKCE.
+
+**How does your API check a token without calling Keycloak every time?**
+The token is a signed JWT. The API downloads Keycloak's public keys (JWKS) once, caches them, and checks the
+signature locally, plus `iss`, `aud` and `exp`. That's fast and works even under heavy load. The trade-off: a token
+stays valid until it expires, so I keep the life short (30 min). For instant revocation you would use token
+introspection (ask Keycloak each time), which is slower.
+
+**What happens when Keycloak rotates its signing key?**
+The new token has a new `kid`. Spring doesn't find it in the cache, downloads the JWKS again and finds it.
+No restart, no code change.
+
+**What is the `aud` check for? Give an example attack.**
+Say the hospital has a second app, "Appointments", in the same realm. A user's token for Appointments is signed by
+the same Keycloak. Without the audience check, my API would accept it. With it, only tokens made for
+`caresummary-api` are accepted.
+
+**What are `state` and `nonce` for?**
+`state` protects the redirect back to my app (login CSRF). `nonce` protects the ID token from replay. Both are random,
+one-use values I make before the redirect and check after.
+
+**Where do you store the token in the browser? Is that safe?**
+In `sessionStorage`, so it's gone when the tab closes and isn't sent automatically like a cookie (no CSRF).
+The risk is XSS: injected JavaScript could read it. React escapes output by default and I don't use
+`dangerouslySetInnerHTML`. For a production health app I would move to a BFF with `HttpOnly` cookies.
+
+**What is SAML and how is it different?**
+An older single sign-on standard using XML messages, common in big enterprises and universities. OIDC uses JSON and
+JWTs and is simpler for web and mobile apps and APIs. Keycloak supports both, and can act as a bridge: users log in
+with a company's SAML identity provider, and my app still gets OIDC tokens.
+
+**Authentication vs authorization in your app?**
+Authentication (who you are) = Keycloak. Authorization (what you may do) = my API's rules (`hasRole("DOCTOR")`).
+The `nurse` demo user proves they are separate: logged in, but forbidden everywhere.
+
+**How did you test it?**
+Three levels. Unit: the role converter. Token rules: I make an RSA key pair in the test, sign real JWTs and check
+that wrong key, wrong issuer, wrong audience, no audience and expired tokens are all rejected, using the **same**
+validator the app uses. API: the whole Spring app in keycloak mode with the decoder mocked, to check roles,
+403s, the audit username and that no password endpoint exists. Then I logged in for real in the browser as
+doctor, admin and nurse.

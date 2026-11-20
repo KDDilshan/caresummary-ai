@@ -1,6 +1,7 @@
 package com.kavindu.caresummaryapi.security;
 
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.GrantedAuthority;
 import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
@@ -14,8 +15,9 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
 
-/** Makes a signed JWT after a successful login. */
+/** Local mode only: makes a signed JWT after a successful login. (In keycloak mode, Keycloak makes the tokens.) */
 @Service
+@ConditionalOnProperty(name = SecurityConfig.MODE, havingValue = "local")
 public class TokenService {
 
     private final JwtEncoder encoder;

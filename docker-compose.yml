@@ -1,7 +1,8 @@
-# Starts the two servers the API needs.
+# Starts the three servers the API needs.
 # Run:  docker compose up -d      Stop:  docker compose stop
 #   FHIR server  -> http://localhost:8090/fhir/Patient   (health data, a database with a REST API)
 #   PostgreSQL   -> localhost:5432                       (audit log)
+#   Keycloak     -> http://localhost:8180                (login server: OAuth 2.0 + OpenID Connect)
 
 services:
   fhir:
@@ -30,6 +31,24 @@ services:
       POSTGRES_PASSWORD: ${DB_PASSWORD:-caresummary}   # local demo only
     volumes:
       - dbdata:/var/lib/postgresql/data              # keeps the audit log when the container restarts
+    restart: unless-stopped
+
+  # Login server. Users, passwords and roles live here, not in our API.
+  # On first start it loads realm "caresummary" (roles, the React client, demo users)
+  # from ./keycloak/caresummary-realm.json. Admin console: http://localhost:8180 (admin / admin).
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4
+    container_name: caresummary-keycloak
+    command: ["start-dev", "--import-realm"]   # dev mode: plain HTTP + built-in database (local demo only)
+    ports:
+      - "8180:8080"
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USER:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}   # local demo only
+      KC_HOSTNAME: "http://localhost:8180"    # so the token "iss" is always http://localhost:8180/realms/caresummary
+      JAVA_OPTS_KC_HEAP: "-Xms128m -Xmx512m"  # keep memory low
+    volumes:
+      - ./keycloak:/opt/keycloak/data/import:ro
     restart: unless-stopped
 
 volumes:

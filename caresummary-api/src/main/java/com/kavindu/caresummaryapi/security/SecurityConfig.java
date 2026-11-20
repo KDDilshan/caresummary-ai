@@ -1,53 +1,39 @@
 package com.kavindu.caresummaryapi.security;
 
-import com.nimbusds.jose.jwk.source.ImmutableSecret;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpMethod;
-import org.springframework.security.authentication.AuthenticationManager;
-import org.springframework.security.authentication.ProviderManager;
-import org.springframework.security.authentication.dao.DaoAuthenticationProvider;
 import org.springframework.security.config.Customizer;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.http.SessionCreationPolicy;
-import org.springframework.security.core.userdetails.User;
-import org.springframework.security.core.userdetails.UserDetailsService;
-import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
-import org.springframework.security.crypto.password.PasswordEncoder;
-import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
-import org.springframework.security.oauth2.jwt.JwtDecoder;
-import org.springframework.security.oauth2.jwt.JwtEncoder;
-import org.springframework.security.oauth2.jwt.NimbusJwtDecoder;
-import org.springframework.security.oauth2.jwt.NimbusJwtEncoder;
 import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationConverter;
-import org.springframework.security.oauth2.server.resource.authentication.JwtGrantedAuthoritiesConverter;
-import org.springframework.security.provisioning.InMemoryUserDetailsManager;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.web.cors.CorsConfiguration;
 import org.springframework.web.cors.CorsConfigurationSource;
 import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 
-import javax.crypto.SecretKey;
-import javax.crypto.spec.SecretKeySpec;
-import java.nio.charset.StandardCharsets;
-import java.security.SecureRandom;
 import java.util.List;
 
 /**
- * Who can do what.
- *  - POST /api/auth/login        : anyone (this is where you get a token)
- *  - /api/patients/**, /api/ai/**: DOCTOR only (patient data)
- *  - /api/audit/**               : ADMIN only (the admin sees the log, not patient records)
- *  - GET /actuator/health        : anyone (only UP/DOWN); other /actuator/** (metrics): ADMIN only
- * Every other request needs a valid JWT in the "Authorization: Bearer ..." header.
+ * Who can do what. The same rules work for both login modes (app.security.mode):
+ *  - keycloak (default): Keycloak logs users in and signs the tokens (RS256). See KeycloakConfig.
+ *  - local            : the old built-in demo login; our API signs the tokens (HS256). See LocalLoginConfig.
+ * In both modes the API is an OAuth 2.0 "resource server": it checks the token in
+ * "Authorization: Bearer ..." on every request. In keycloak mode it never sees a password.
+ *
+ *  - GET  /api/auth/config        : anyone (tells the React app which login to show)
+ *  - POST /api/auth/login         : anyone (local mode only; this is where you get a token)
+ *  - /api/patients/**, /api/ai/** : DOCTOR only (patient data)
+ *  - /api/audit/**                : ADMIN only (the admin sees the log, not patient records)
+ *  - GET /actuator/health         : anyone (only UP/DOWN); other /actuator/** (metrics): ADMIN only
+ *  - anything else                : any valid token
  */
 @Configuration
 public class SecurityConfig {
 
-    private static final Logger log = LoggerFactory.getLogger(SecurityConfig.class);
+    /** Property that picks the login mode: "keycloak" (default) or "local". */
+    public static final String MODE = "app.security.mode";
 
     @Bean
     public SecurityFilterChain filterChain(HttpSecurity http, JwtAuthenticationConverter jwtConverter) throws Exception {
@@ -57,6 +43,7 @@ public class SecurityConfig {
                 .cors(Customizer.withDefaults())
                 .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(auth -> auth
+                        .requestMatchers(HttpMethod.GET, "/api/auth/config").permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/auth/login").permitAll()
                         .requestMatchers("/error").permitAll()
                         // Health check is open (load balancers and uptime monitors call it without a login).
@@ -66,75 +53,10 @@ public class SecurityConfig {
                         .requestMatchers("/api/audit/**").hasRole("ADMIN")
                         .requestMatchers("/api/patients/**", "/api/ai/**").hasRole("DOCTOR")
                         .anyRequest().authenticated())
+                // jwtConverter comes from KeycloakConfig or LocalLoginConfig: it turns a checked token into a user + roles
                 .oauth2ResourceServer(o -> o.jwt(jwt -> jwt.jwtAuthenticationConverter(jwtConverter)));
         return http.build();
     }
-
-    // ---------- users ----------
-
-    @Bean
-    public PasswordEncoder passwordEncoder() {
-        return new BCryptPasswordEncoder();   // passwords are stored hashed, never as plain text
-    }
-
-    /** Two demo users kept in memory. A real system would use a database or a hospital login (SSO). */
-    @Bean
-    public UserDetailsService users(PasswordEncoder encoder,
-                                    @Value("${app.security.doctor-password}") String doctorPw,
-                                    @Value("${app.security.admin-password}") String adminPw) {
-        return new InMemoryUserDetailsManager(
-                User.withUsername("doctor").password(encoder.encode(doctorPw)).roles("DOCTOR").build(),
-                User.withUsername("admin").password(encoder.encode(adminPw)).roles("ADMIN").build());
-    }
-
-    @Bean
-    public AuthenticationManager authenticationManager(UserDetailsService users, PasswordEncoder encoder) {
-        DaoAuthenticationProvider provider = new DaoAuthenticationProvider(users);
-        provider.setPasswordEncoder(encoder);
-        return new ProviderManager(provider);
-    }
-
-    // ---------- JWT ----------
-
-    /** The secret used to sign tokens. Same key signs (encoder) and checks (decoder) them: HMAC-SHA256. */
-    @Bean
-    public SecretKey jwtKey(@Value("${app.security.jwt-secret:}") String secret) {
-        byte[] bytes;
-        if (secret == null || secret.isBlank()) {
-            bytes = new byte[32];
-            new SecureRandom().nextBytes(bytes);
-            log.warn("JWT_SECRET is not set: using a random key. Logins end when the app restarts.");
-        } else {
-            bytes = secret.getBytes(StandardCharsets.UTF_8);
-            if (bytes.length < 32) {
-                throw new IllegalStateException("JWT_SECRET must be at least 32 characters");
-            }
-        }
-        return new SecretKeySpec(bytes, "HmacSHA256");
-    }
-
-    @Bean
-    public JwtEncoder jwtEncoder(SecretKey jwtKey) {
-        return new NimbusJwtEncoder(new ImmutableSecret<>(jwtKey));
-    }
-
-    @Bean
-    public JwtDecoder jwtDecoder(SecretKey jwtKey) {
-        return NimbusJwtDecoder.withSecretKey(jwtKey).macAlgorithm(MacAlgorithm.HS256).build();
-    }
-
-    /** Reads the "roles" claim of the token, e.g. ["DOCTOR"], and turns it into ROLE_DOCTOR. */
-    @Bean
-    public JwtAuthenticationConverter jwtAuthenticationConverter() {
-        JwtGrantedAuthoritiesConverter roles = new JwtGrantedAuthoritiesConverter();
-        roles.setAuthoritiesClaimName("roles");
-        roles.setAuthorityPrefix("ROLE_");
-        JwtAuthenticationConverter converter = new JwtAuthenticationConverter();
-        converter.setJwtGrantedAuthoritiesConverter(roles);
-        return converter;
-    }
-
-    // ---------- CORS ----------
 
     /** Lets the React app (another port in development) call this API. */
     @Bean

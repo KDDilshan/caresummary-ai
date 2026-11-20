@@ -1,0 +1,93 @@
+{
+  "realm": "caresummary",
+  "displayName": "CareSummary AI",
+  "enabled": true,
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "resetPasswordAllowed": false,
+  "rememberMe": false,
+  "loginWithEmailAllowed": false,
+  "bruteForceProtected": true,
+  "failureFactor": 5,
+  "maxFailureWaitSeconds": 900,
+  "accessTokenLifespan": 1800,
+  "ssoSessionIdleTimeout": 3600,
+  "ssoSessionMaxLifespan": 36000,
+  "eventsEnabled": true,
+  "eventsExpiration": 604800,
+  "enabledEventTypes": ["LOGIN", "LOGIN_ERROR", "LOGOUT", "CODE_TO_TOKEN", "CODE_TO_TOKEN_ERROR"],
+  "roles": {
+    "realm": [
+      { "name": "DOCTOR", "description": "Can see patients and use the AI summary / Q&A" },
+      { "name": "ADMIN", "description": "Can see the audit log only (no patient data)" }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "caresummary-ui",
+      "name": "CareSummary AI web app",
+      "description": "The React app. Public client (a browser cannot keep a secret), so it must use PKCE.",
+      "enabled": true,
+      "publicClient": true,
+      "protocol": "openid-connect",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": ["http://localhost:5173/*"],
+      "webOrigins": ["http://localhost:5173"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "http://localhost:5173/*"
+      },
+      "defaultClientScopes": ["web-origins", "acr", "basic", "profile", "roles", "email"],
+      "optionalClientScopes": ["offline_access"],
+      "protocolMappers": [
+        {
+          "name": "audience: caresummary-api",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "caresummary-api",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "doctor",
+      "enabled": true,
+      "email": "doctor@caresummary.local",
+      "emailVerified": true,
+      "firstName": "Demo",
+      "lastName": "Doctor",
+      "credentials": [{ "type": "password", "value": "doctor123", "temporary": false }],
+      "realmRoles": ["DOCTOR"]
+    },
+    {
+      "username": "admin",
+      "enabled": true,
+      "email": "admin@caresummary.local",
+      "emailVerified": true,
+      "firstName": "Demo",
+      "lastName": "Admin",
+      "credentials": [{ "type": "password", "value": "admin123", "temporary": false }],
+      "realmRoles": ["ADMIN"]
+    },
+    {
+      "username": "nurse",
+      "enabled": true,
+      "email": "nurse@caresummary.local",
+      "emailVerified": true,
+      "firstName": "Demo",
+      "lastName": "Nurse",
+      "credentials": [{ "type": "password", "value": "nurse123", "temporary": false }],
+      "realmRoles": []
+    }
+  ]
+}

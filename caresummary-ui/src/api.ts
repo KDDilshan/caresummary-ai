@@ -1,4 +1,4 @@
-import type { AiResponse, AuditEvent, PatientDetail, PatientSummary, Session } from './types'
+import type { AiResponse, AuditEvent, AuthConfig, PatientDetail, PatientSummary, Session } from './types'
 
 // All calls to the Spring Boot API. The JWT token is sent in the Authorization header.
 
@@ -60,6 +60,10 @@ export async function login(username: string, password: string): Promise<Session
 }
 
 export const api = {
+  // Which login to show: Keycloak (OpenID Connect) or the local demo form
+  authConfig: () => call<AuthConfig>('/api/auth/config', null),
+  // Who am I, after the API has checked the token
+  me: (token: string) => call<{ username: string; roles: string[] }>('/api/auth/me', token),
   patients: (token: string, name: string) =>
     call<PatientSummary[]>(`/api/patients${name ? `?name=${encodeURIComponent(name)}` : ''}`, token),
   patient: (token: string, id: string) => call<PatientDetail>(`/api/patients/${encodeURIComponent(id)}`, token),
